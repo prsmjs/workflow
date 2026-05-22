@@ -148,14 +148,21 @@ export function defineWorkflow(definition) {
     }
   }
 
-  const nodes = Object.values(steps).map((step) => ({
-    name: step.name,
-    label: step.label,
-    type: step.type,
-    description: step.description,
-    retry: clone(step.retry),
-    timeout: step.timeout ?? null,
-  }))
+  const nodes = Object.values(steps).map((step) => {
+    const node = {
+      name: step.name,
+      label: step.label,
+      type: step.type,
+      description: step.description,
+      retry: clone(step.retry),
+      timeout: step.timeout ?? null,
+    }
+    if (step.type === 'subworkflow') {
+      node.workflow = step.workflow
+      node.version = step.version ?? null
+    }
+    return node
+  })
 
   const edges = Object.values(steps).flatMap((step) => inferEdgeLabels(step))
 

@@ -137,6 +137,53 @@ describe('@prsm/workflow', () => {
     ])
   })
 
+  it('exposes the child workflow reference on subworkflow graph nodes', () => {
+    const workflow = defineWorkflow({
+      name: 'parent',
+      version: '1',
+      start: 'spawn',
+      steps: {
+        spawn: {
+          type: 'subworkflow',
+          workflow: 'child-flow',
+          version: '2',
+          input: () => ({}),
+          transitions: { succeeded: 'done', failed: 'done', canceled: 'done' },
+        },
+        done: { type: 'succeed', result: () => ({}) },
+      },
+    })
+
+    const spawn = workflow.graph.nodes.find((node) => node.name === 'spawn')
+    expect(spawn.type).toBe('subworkflow')
+    expect(spawn.workflow).toBe('child-flow')
+    expect(spawn.version).toBe('2')
+
+    const done = workflow.graph.nodes.find((node) => node.name === 'done')
+    expect(done.workflow).toBeUndefined()
+  })
+
+  it('defaults subworkflow node version to null when unpinned', () => {
+    const workflow = defineWorkflow({
+      name: 'parent2',
+      version: '1',
+      start: 'spawn',
+      steps: {
+        spawn: {
+          type: 'subworkflow',
+          workflow: 'child-flow',
+          input: () => ({}),
+          transitions: { succeeded: 'done', failed: 'done', canceled: 'done' },
+        },
+        done: { type: 'succeed', result: () => ({}) },
+      },
+    })
+
+    const spawn = workflow.graph.nodes.find((node) => node.name === 'spawn')
+    expect(spawn.workflow).toBe('child-flow')
+    expect(spawn.version).toBe(null)
+  })
+
   it('runs an execution to success with deterministic routing', async () => {
     const workflow = defineWorkflow({
       name: 'review',
