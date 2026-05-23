@@ -154,23 +154,35 @@ export class WorkflowEngine extends EventEmitter {
     await this.ready()
 
     const workflow = this._resolveWorkflow(name, options.version)
-    const execution = this._createExecution(workflow, input, options)
-    if (options.parent) {
-      execution.parent = clone(options.parent)
-    }
-    if (this._tracer) {
-      const traceparent = this._tracer.toTraceparent()
-      if (traceparent) execution.traceparent = traceparent
+    const doStart = async () => {
+      const execution = this._createExecution(workflow, input, options)
+      if (options.parent) {
+        execution.parent = clone(options.parent)
+      }
+      if (this._tracer) {
+        const traceparent = this._tracer.toTraceparent()
+        if (traceparent) execution.traceparent = traceparent
+      }
+
+      await this._storage.createExecution(execution)
+      this.emit('execution:queued', { execution: clone(execution) })
+      return clone(execution)
     }
 
-    await this._storage.createExecution(execution)
-    this.emit('execution:queued', { execution: clone(execution) })
-    return clone(execution)
+    if (!this._tracer) return await doStart()
+    return await this._tracer.span(`workflow.start:${name}`, {
+      'workflow.name': workflow.name,
+      'workflow.version': workflow.version,
+    }, doStart)
   }
 
   async signal(id, payload) {
     await this.ready()
+    if (!this._tracer) return this._signal(id, payload)
+    return this._tracer.span('workflow.signal', { 'workflow.execution': id }, () => this._signal(id, payload))
+  }
 
+  async _signal(id, payload) {
     const execution = await this._storage.getExecution(id)
     if (!execution) throw new Error(`execution not found: ${id}`)
     if (execution.status !== 'suspended') {
@@ -217,7 +229,11 @@ export class WorkflowEngine extends EventEmitter {
 
   async cancel(id, reason = 'Canceled') {
     await this.ready()
+    if (!this._tracer) return this._cancel(id, reason)
+    return this._tracer.span('workflow.cancel', { 'workflow.execution': id }, () => this._cancel(id, reason))
+  }
 
+  async _cancel(id, reason) {
     const execution = await this._storage.getExecution(id)
     if (!execution) throw new Error(`execution not found: ${id}`)
     if (TERMINAL_EXECUTION_STATUSES.has(execution.status)) return clone(execution)
@@ -261,7 +277,11 @@ export class WorkflowEngine extends EventEmitter {
 
   async resume(id) {
     await this.ready()
+    if (!this._tracer) return this._resume(id)
+    return this._tracer.span('workflow.resume', { 'workflow.execution': id }, () => this._resume(id))
+  }
 
+  async _resume(id) {
     const execution = await this._storage.getExecution(id)
     if (!execution) throw new Error(`execution not found: ${id}`)
     if (execution.status !== 'failed') throw new Error('only failed executions can be resumed')
