@@ -105,6 +105,7 @@ export class WorkflowEngine extends EventEmitter {
   constructor(options = {}) {
     super()
 
+    this._tracer = options.tracer ?? null
     this._storage = options.storage ?? memoryDriver()
     this._workflows = new Map()
     this._owner = options.owner ?? `workflow-engine:${randomUUID()}`
@@ -156,6 +157,10 @@ export class WorkflowEngine extends EventEmitter {
     const execution = this._createExecution(workflow, input, options)
     if (options.parent) {
       execution.parent = clone(options.parent)
+    }
+    if (this._tracer) {
+      const traceparent = this._tracer.toTraceparent()
+      if (traceparent) execution.traceparent = traceparent
     }
 
     await this._storage.createExecution(execution)
@@ -809,7 +814,20 @@ export class WorkflowEngine extends EventEmitter {
 
     const heartbeat = this._startLeaseHeartbeat(execution.id, stepName)
 
-    try {
+    const traceParent = this._tracer && execution.traceparent ? this._tracer.fromTraceparent(execution.traceparent) : null
+    const stepSpan = this._tracer?.startSpan(`workflow.step:${stepName}`, {
+      'workflow.name': workflow.name,
+      'workflow.version': workflow.version,
+      'workflow.execution': execution.id,
+      'workflow.step': stepName,
+      'workflow.step.type': definition.type,
+      'workflow.step.attempt': stepState.attempts,
+    }, {
+      kind: 'internal',
+      parent: traceParent ? { traceId: traceParent.traceId, spanId: traceParent.parentSpanId, sampled: traceParent.sampled } : null,
+    })
+
+    const runStep = async () => {
       const context = stepContext(execution, workflow, stepName)
       const timeoutMs = normalizeMs(definition.timeout ?? (definition.type === 'activity' ? this._defaultActivityTimeout : 0))
 
@@ -855,9 +873,19 @@ export class WorkflowEngine extends EventEmitter {
           : clone(definition.result ?? null)
         await this._completeTerminalStep(execution, definition, stepName, stepState, output, heartbeat)
       }
+    }
+
+    try {
+      if (stepSpan) {
+        await this._tracer.run(stepSpan.context, runStep)
+      } else {
+        await runStep()
+      }
     } catch (error) {
+      stepSpan?.setError(error)
       await this._handleStepFailure(execution, definition, stepName, stepState, error, heartbeat)
     } finally {
+      stepSpan?.end()
       heartbeat.stop()
     }
   }
