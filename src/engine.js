@@ -4,6 +4,21 @@ import ms from '@prsm/ms'
 import { memoryDriver } from './memoryDriver.js'
 import { clone } from './util.js'
 
+const DISTRIBUTED_EVENTS = new Set([
+  'execution:queued',
+  'execution:succeeded',
+  'execution:failed',
+  'execution:canceled',
+  'execution:lease-lost',
+  'step:started',
+  'step:succeeded',
+  'step:routed',
+  'step:retry',
+  'step:failed',
+  'step:suspended',
+  'step:resumed',
+])
+
 const DEFAULT_RETRY = { maxAttempts: 1, backoff: 0 }
 const TERMINAL_EXECUTION_STATUSES = new Set(['succeeded', 'failed', 'canceled'])
 const PROCESSABLE_EXECUTION_STATUSES = new Set(['queued', 'waiting'])
@@ -109,6 +124,7 @@ export class WorkflowEngine extends EventEmitter {
     this._storage = options.storage ?? memoryDriver()
     this._workflows = new Map()
     this._owner = options.owner ?? `workflow-engine:${randomUUID()}`
+    this._instanceId = randomUUID()
     this._leaseMs = normalizeMs(options.leaseMs ?? '5m')
     this._defaultActivityTimeout = normalizeMs(options.defaultActivityTimeout ?? '30s')
     this._leaseRenewInterval = normalizeMs(options.leaseRenewInterval ?? Math.max(10, Math.floor(this._leaseMs / 3)))
@@ -117,12 +133,53 @@ export class WorkflowEngine extends EventEmitter {
     this._activePoll = null
     this._batchSize = options.batchSize ?? 10
     this._maxJournalEntries = options.maxJournalEntries ?? 0
+
+    this._pubsubConfig = options.pubsub ?? null
+    this._pubsubPrefix = options.pubsubPrefix ?? 'workflow:'
+    this._eventsChannel = `${this._pubsubPrefix}events`
+    this._pubClient = null
+    this._subClient = null
+
+    if (this._pubsubConfig) {
+      const baseEmit = super.emit.bind(this)
+      this.emit = (event, payload) => {
+        const result = baseEmit(event, payload)
+        if (DISTRIBUTED_EVENTS.has(event) && this._pubClient?.isOpen) {
+          let body
+          try { body = JSON.stringify({ event, payload, from: this._instanceId }) } catch { return result }
+          this._pubClient.publish(this._eventsChannel, body).catch(() => {})
+        }
+        return result
+      }
+    }
   }
 
   async ready() {
     if (this._started) return
     this._started = true
     if (this._storage.init) await this._storage.init()
+    if (this._pubsubConfig) {
+      const baseRedis = this._pubsubConfig.redis ?? this._pubsubConfig
+      if (typeof baseRedis.duplicate === 'function') {
+        this._pubClient = baseRedis
+      } else {
+        const { createClient } = await import('redis')
+        this._pubClient = createClient(baseRedis)
+      }
+      this._pubClient.on?.('error', () => {})
+      this._subClient = this._pubClient.duplicate()
+      this._subClient.on?.('error', () => {})
+
+      if (!this._pubClient.isOpen) await this._pubClient.connect()
+      if (!this._subClient.isOpen) await this._subClient.connect()
+      await this._subClient.subscribe(this._eventsChannel, (message) => {
+        try {
+          const { event, payload, from } = JSON.parse(message)
+          if (from === this._instanceId) return
+          super.emit(event, payload)
+        } catch {}
+      })
+    }
   }
 
   register(workflow) {
@@ -361,6 +418,9 @@ export class WorkflowEngine extends EventEmitter {
     this._pollTimer = null
     await this._activePoll
     if (this._storage.close) await this._storage.close()
+    if (this._subClient?.isOpen) await this._subClient.unsubscribe().catch(() => {})
+    if (this._subClient?.isOpen) await this._subClient.quit().catch(() => {})
+    if (this._pubClient?.isOpen) await this._pubClient.quit().catch(() => {})
   }
 
   _createExecution(workflow, input, options) {
