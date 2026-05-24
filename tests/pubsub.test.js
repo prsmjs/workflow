@@ -4,6 +4,18 @@ import { createClient } from "redis"
 
 const redisOpts = { socket: { host: "127.0.0.1", port: 6379 } }
 
+let redisReachable = false
+try {
+  const probe = createClient(redisOpts)
+  probe.on("error", () => {})
+  await probe.connect()
+  await probe.ping()
+  redisReachable = true
+  await probe.quit()
+} catch {}
+
+const describeIfRedis = redisReachable ? describe : describe.skip
+
 function defineSimple() {
   return defineWorkflow({
     name: "echo",
@@ -23,7 +35,7 @@ function defineSimple() {
   })
 }
 
-describe("pubsub: cross-instance event fan-out", () => {
+describeIfRedis("pubsub: cross-instance event fan-out", () => {
   let a, b, flushClient
 
   beforeEach(async () => {
