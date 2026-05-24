@@ -71,6 +71,27 @@ describe("pubsub: cross-instance event fan-out", () => {
     expect(stepEventsOnB.some((e) => e.step === "first" && e.id === execution.id)).toBe(true)
   })
 
+  it("listWorkflowsAcrossInstances returns each instance's registered workflows", async () => {
+    const onlyOnA = defineWorkflow({
+      name: "extra",
+      version: "1",
+      start: "done",
+      steps: { done: { type: "succeed", result: () => ({}) } },
+    })
+    a.register(onlyOnA)
+
+    // wait for heartbeat to write
+    await new Promise((r) => setTimeout(r, 200))
+
+    const fromB = await b.listWorkflowsAcrossInstances()
+    const aInstanceId = Object.keys(fromB).find((id) => fromB[id].some((w) => w.name === "extra"))
+    expect(aInstanceId).toBeTruthy()
+    // every instance has echo
+    for (const wfs of Object.values(fromB)) {
+      expect(wfs.some((w) => w.name === "echo")).toBe(true)
+    }
+  })
+
   it("instance does not double-fire its own events", async () => {
     let succeededCount = 0
     a.on("execution:succeeded", () => { succeededCount++ })

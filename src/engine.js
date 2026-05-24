@@ -179,13 +179,63 @@ export class WorkflowEngine extends EventEmitter {
           super.emit(event, payload)
         } catch {}
       })
+
+      this._registryKey = `${this._pubsubPrefix}registry:${this._instanceId}`
+      this._registryTtlSec = 60
+      this._registryHeartbeatMs = 15000
+      await this._writeRegistry()
+      this._registryTimer = setInterval(() => { this._writeRegistry() }, this._registryHeartbeatMs)
+      this._registryTimer.unref?.()
     }
+  }
+
+  async _writeRegistry() {
+    if (!this._pubClient?.isOpen) return
+    const snapshot = {
+      instanceId: this._instanceId,
+      workflows: Array.from(this._workflows.values()).map((wf) => ({
+        name: wf.name,
+        version: wf.version,
+        description: wf.description,
+        graph: wf.graph,
+      })),
+    }
+    try {
+      await this._pubClient.set(this._registryKey, JSON.stringify(snapshot), { EX: this._registryTtlSec })
+    } catch {}
+  }
+
+  async listWorkflowsAcrossInstances() {
+    const local = this.listWorkflows().map((w) => ({ ...w, instanceId: this._instanceId }))
+    if (!this._pubClient?.isOpen) return { [this._instanceId]: this.listWorkflows() }
+    const out = { [this._instanceId]: this.listWorkflows() }
+    try {
+      const keys = []
+      for await (const batch of this._pubClient.scanIterator({ MATCH: `${this._pubsubPrefix}registry:*`, COUNT: 100 })) {
+        if (Array.isArray(batch)) keys.push(...batch)
+        else keys.push(batch)
+      }
+      if (keys.length) {
+        const values = await this._pubClient.mGet(keys)
+        keys.forEach((key, i) => {
+          const id = key.slice(`${this._pubsubPrefix}registry:`.length)
+          if (id === this._instanceId) return
+          if (!values[i]) return
+          try {
+            const snap = JSON.parse(values[i])
+            out[id] = (snap.workflows ?? []).map((w) => ({ name: w.name, version: w.version, description: w.description }))
+          } catch {}
+        })
+      }
+    } catch {}
+    return out
   }
 
   register(workflow) {
     const key = `${workflow.name}@${workflow.version}`
     if (this._workflows.has(key)) throw new Error(`workflow already registered: ${key}`)
     this._workflows.set(key, workflow)
+    if (this._started && this._pubClient?.isOpen) this._writeRegistry().catch(() => {})
     return this
   }
 
@@ -416,8 +466,13 @@ export class WorkflowEngine extends EventEmitter {
   async close() {
     if (this._pollTimer) clearInterval(this._pollTimer)
     this._pollTimer = null
+    if (this._registryTimer) clearInterval(this._registryTimer)
+    this._registryTimer = null
     await this._activePoll
     if (this._storage.close) await this._storage.close()
+    if (this._pubClient?.isOpen && this._registryKey) {
+      await this._pubClient.del(this._registryKey).catch(() => {})
+    }
     if (this._subClient?.isOpen) await this._subClient.unsubscribe().catch(() => {})
     if (this._subClient?.isOpen) await this._subClient.quit().catch(() => {})
     if (this._pubClient?.isOpen) await this._pubClient.quit().catch(() => {})
