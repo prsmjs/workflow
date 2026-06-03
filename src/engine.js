@@ -42,7 +42,7 @@ function serializeError(error) {
   }
 }
 
-function withTimeout(promise, timeoutMs, message) {
+function withTimeout(promise, timeoutMs, message, onTimeout) {
   if (!timeoutMs || timeoutMs <= 0) return promise
 
   let timer = null
@@ -50,7 +50,10 @@ function withTimeout(promise, timeoutMs, message) {
   return Promise.race([
     promise,
     new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+      timer = setTimeout(() => {
+        onTimeout?.()
+        reject(new Error(message))
+      }, timeoutMs)
       timer.unref?.()
     }),
   ]).finally(() => {
@@ -947,7 +950,10 @@ export class WorkflowEngine extends EventEmitter {
 
     this.emit('step:started', { execution: clone(execution), step: stepName, attempt: stepState.attempts })
 
-    const heartbeat = this._startLeaseHeartbeat(execution.id, stepName)
+    const abort = new AbortController()
+    const heartbeat = this._startLeaseHeartbeat(execution.id, stepName, () => {
+      abort.abort(new LeaseLostError(execution.id, stepName))
+    })
 
     const traceParent = this._tracer && execution.traceparent ? this._tracer.fromTraceparent(execution.traceparent) : null
     const stepSpan = this._tracer?.startSpan(`workflow.step:${stepName}`, {
@@ -964,13 +970,17 @@ export class WorkflowEngine extends EventEmitter {
 
     const runStep = async () => {
       const context = stepContext(execution, workflow, stepName)
+      context.signal = abort.signal
       const timeoutMs = normalizeMs(definition.timeout ?? (definition.type === 'activity' ? this._defaultActivityTimeout : 0))
+      const timeoutMessage = `Step "${stepName}" timed out after ${timeoutMs}ms`
+      const abortOnTimeout = () => abort.abort(new Error(timeoutMessage))
 
       if (definition.type === 'activity') {
         const output = await withTimeout(
           Promise.resolve(definition.run(context)),
           timeoutMs,
-          `Step "${stepName}" timed out after ${timeoutMs}ms`,
+          timeoutMessage,
+          abortOnTimeout,
         )
 
         await this._completeActivityStep(execution, definition, stepName, stepState, output, heartbeat)
@@ -981,7 +991,8 @@ export class WorkflowEngine extends EventEmitter {
         const route = await withTimeout(
           Promise.resolve(definition.decide(context)),
           timeoutMs,
-          `Step "${stepName}" timed out after ${timeoutMs}ms`,
+          timeoutMessage,
+          abortOnTimeout,
         )
 
         await this._completeDecisionStep(execution, definition, stepName, stepState, route, heartbeat)
@@ -1003,7 +1014,8 @@ export class WorkflowEngine extends EventEmitter {
           ? await withTimeout(
               Promise.resolve(definition.result(context)),
               timeoutMs,
-              `Step "${stepName}" timed out after ${timeoutMs}ms`,
+              timeoutMessage,
+              abortOnTimeout,
             )
           : clone(definition.result ?? null)
         await this._completeTerminalStep(execution, definition, stepName, stepState, output, heartbeat)
@@ -1025,7 +1037,7 @@ export class WorkflowEngine extends EventEmitter {
     }
   }
 
-  _startLeaseHeartbeat(executionId, stepName) {
+  _startLeaseHeartbeat(executionId, stepName, onLost) {
     if (!this._storage.renewLease) {
       return {
         lost: false,
@@ -1035,6 +1047,11 @@ export class WorkflowEngine extends EventEmitter {
     }
 
     let lost = false
+    const markLost = () => {
+      if (lost) return
+      lost = true
+      onLost?.()
+    }
     const interval = setInterval(async () => {
       try {
         const renewed = await this._storage.renewLease(executionId, {
@@ -1042,9 +1059,9 @@ export class WorkflowEngine extends EventEmitter {
           now: Date.now(),
           leaseMs: this._leaseMs,
         })
-        if (!renewed) lost = true
+        if (!renewed) markLost()
       } catch {
-        lost = true
+        markLost()
       }
     }, this._leaseRenewInterval)
     interval.unref?.()

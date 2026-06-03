@@ -81,9 +81,9 @@ console.log(result.output) // { outcome: "sent", message: "hello" }
   next: "publish",
   timeout: "30s",
   retry: { maxAttempts: 3, backoff: "5s" },
-  run: async ({ input, data, steps, step }) => {
+  run: async ({ input, data, steps, step, signal }) => {
     console.log(step.idempotencyKey)
-    return await doWork(input)
+    return await doWork(input, { signal })
   },
 }
 ```
@@ -357,6 +357,24 @@ When an activity step returns a plain object, it is shallow-merged into `executi
 
 All context fields passed to step handlers are cloned - mutations inside a handler do not affect stored execution state.
 
+## Cancellation
+
+Every `activity`, `decision`, and terminal handler receives an `AbortSignal` as `context.signal`. The engine aborts it when the step exceeds its `timeout`, when the worker loses the execution's lease, or when the execution is canceled while the step is in flight. Forward it to anything that supports one (`fetch`, a database driver, a child process) so abandoned work stops instead of running against an execution that has already moved on:
+
+```js
+{
+  type: "activity",
+  next: "store",
+  timeout: "10s",
+  run: async ({ input, signal }) => {
+    const res = await fetch(input.url, { signal })
+    return { body: await res.json() }
+  },
+}
+```
+
+The signal is advisory. A handler that ignores it still runs to completion, but its result is discarded once the step has timed out or the lease is gone, and the engine applies the normal retry and failure rules.
+
 ## Resuming Failed Executions
 
 `engine.resume(id)` re-queues a failed execution from the step that failed. The step's attempt counter is not reset - resume gives the step exactly one more execution attempt. If that attempt fails and the retry budget is already exhausted, the execution fails immediately.
@@ -381,9 +399,9 @@ Workers claim ready executions using a lease and process them concurrently (up t
 
 ### Completed steps are never re-executed
 
-If a worker completes a step but crashes before advancing to the next one, another worker will reclaim the execution. The engine checks whether the current step already succeeded and skips it, advancing directly to the next step without re-running the handler. This prevents duplicate side effects like double-charging a credit card or sending an email twice.
+Marking a step succeeded and advancing `currentStep` to its successor happen in a single owner-guarded write. There is no moment where a step is recorded as done but the execution still points at it. A crash therefore leaves the execution in one of two states: the completing write never landed, so a reclaiming worker re-runs the step (at-least-once), or it did land, so the reclaiming worker resumes from the next step. A step that finished is never run a second time.
 
-For side effects that happen *within* a step (e.g. the step sends an email, then crashes before the step result is saved), each step exposes a stable `idempotencyKey` (`<executionId>:<stepName>`) that you can pass to external services for deduplication.
+That covers a crash *between* steps. For a side effect that happens *within* a step and then crashes before the step result is saved (the step sends an email, then dies), the step itself will be retried, so make the side effect idempotent. Each step exposes a stable `idempotencyKey` (`<executionId>:<stepName>`) you can pass to external services for deduplication.
 
 ## Distributed Tests
 
