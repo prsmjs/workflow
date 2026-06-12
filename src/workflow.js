@@ -1,5 +1,27 @@
 import { clone } from './util.js'
 
+const HANDLER_SLOTS = {
+  activity: 'run',
+  decision: 'decide',
+  wait: 'resolve',
+  subworkflow: 'input',
+  succeed: 'result',
+  fail: 'result',
+}
+
+function bindHandler(name, step, handlers) {
+  if (step.handler == null) return
+  if (typeof step.handler !== 'string') throw new Error(`step "${name}" handler must be a string`)
+
+  const slot = HANDLER_SLOTS[step.type]
+  if (!slot) throw new Error(`step "${name}" has unsupported type "${step.type}"`)
+  if (step[slot] != null) throw new Error(`step "${name}" cannot define both "${slot}" and handler`)
+
+  const fn = handlers?.[step.handler]
+  if (typeof fn !== 'function') throw new Error(`step "${name}" references unknown handler "${step.handler}"`)
+  step[slot] = fn
+}
+
 function normalizeRetry(retry) {
   if (retry == null) return { maxAttempts: 1, backoff: 0 }
   if (typeof retry === 'number') return { maxAttempts: retry, backoff: 0 }
@@ -26,13 +48,14 @@ function inferEdgeLabels(step) {
   return []
 }
 
-function collectReachable(start, steps) {
+function collectReachable(start, steps, allowCycles) {
   const seen = new Set()
   const visiting = new Set()
 
   function visit(stepName) {
     if (visiting.has(stepName)) {
-      throw new Error(`workflow graph must be acyclic; cycle detected at "${stepName}"`)
+      if (allowCycles) return
+      throw new Error(`workflow graph must be acyclic; cycle detected at "${stepName}" (set cycles: true to allow back-edges)`)
     }
     if (seen.has(stepName)) return
     const step = steps[stepName]
@@ -116,15 +139,24 @@ function validateStep(name, step, stepNames) {
   if (!Number.isInteger(retry.maxAttempts) || retry.maxAttempts < 1) {
     throw new Error(`step "${name}" retry.maxAttempts must be a positive integer`)
   }
+
+  if (step.params != null && (typeof step.params !== 'object' || Array.isArray(step.params))) {
+    throw new Error(`step "${name}" params must be a plain object`)
+  }
+
+  if (step.maxPasses != null && (!Number.isInteger(step.maxPasses) || step.maxPasses < 1)) {
+    throw new Error(`step "${name}" maxPasses must be a positive integer`)
+  }
 }
 
-export function defineWorkflow(definition) {
+export function defineWorkflow(definition, options = {}) {
   if (!definition || typeof definition !== 'object') throw new Error('workflow definition required')
   if (!definition.name || typeof definition.name !== 'string') throw new Error('workflow name is required')
   if (!definition.version || typeof definition.version !== 'string') throw new Error('workflow version is required')
   if (!definition.start || typeof definition.start !== 'string') throw new Error('workflow start step is required')
   if (!definition.steps || typeof definition.steps !== 'object') throw new Error('workflow steps are required')
 
+  const allowCycles = definition.cycles === true
   const stepNames = new Set(Object.keys(definition.steps))
   if (!stepNames.has(definition.start)) throw new Error(`workflow start step "${definition.start}" does not exist`)
 
@@ -137,11 +169,12 @@ export function defineWorkflow(definition) {
       ...rawStep,
       retry: normalizeRetry(rawStep.retry),
     }
+    bindHandler(name, step, options.handlers)
     validateStep(name, step, stepNames)
     steps[name] = step
   }
 
-  const reachable = collectReachable(definition.start, steps)
+  const reachable = collectReachable(definition.start, steps, allowCycles)
   for (const name of stepNames) {
     if (!reachable.has(name)) {
       throw new Error(`step "${name}" is unreachable from start step "${definition.start}"`)
@@ -156,6 +189,9 @@ export function defineWorkflow(definition) {
       description: step.description,
       retry: clone(step.retry),
       timeout: step.timeout ?? null,
+      handler: step.handler ?? null,
+      params: clone(step.params) ?? null,
+      maxPasses: step.maxPasses ?? null,
     }
     if (step.type === 'subworkflow') {
       node.workflow = step.workflow
@@ -171,6 +207,7 @@ export function defineWorkflow(definition) {
     version: definition.version,
     start: definition.start,
     description: definition.description ?? '',
+    cycles: allowCycles,
     steps: Object.freeze(steps),
     graph: Object.freeze({
       start: definition.start,

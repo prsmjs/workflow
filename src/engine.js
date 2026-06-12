@@ -9,6 +9,7 @@ const DISTRIBUTED_EVENTS = new Set([
   'execution:succeeded',
   'execution:failed',
   'execution:canceled',
+  'execution:paused',
   'execution:lease-lost',
   'step:started',
   'step:succeeded',
@@ -66,8 +67,8 @@ function normalizeMs(value, fallback = 0) {
   return ms(value)
 }
 
-function ensureStepState(execution, stepName) {
-  execution.steps[stepName] = execution.steps[stepName] ?? {
+function freshStepState(execution, stepName, pass = 1) {
+  return {
     status: 'pending',
     attempts: 0,
     output: null,
@@ -75,8 +76,13 @@ function ensureStepState(execution, stepName) {
     startedAt: null,
     endedAt: null,
     route: null,
-    idempotencyKey: `${execution.id}:${stepName}`,
+    pass,
+    idempotencyKey: pass > 1 ? `${execution.id}:${stepName}:${pass}` : `${execution.id}:${stepName}`,
   }
+}
+
+function ensureStepState(execution, stepName) {
+  execution.steps[stepName] = execution.steps[stepName] ?? freshStepState(execution, stepName)
   return execution.steps[stepName]
 }
 
@@ -94,10 +100,12 @@ function stepContext(execution, workflow, stepName) {
     data: clone(execution.data),
     metadata: clone(execution.metadata),
     steps: clone(execution.steps),
+    params: clone(currentStep.params ?? {}),
     step: {
       name: stepName,
       type: currentStep.type,
       attempt: stepState?.attempts ?? 0,
+      pass: stepState?.pass ?? 1,
       idempotencyKey: stepState?.idempotencyKey ?? `${execution.id}:${stepName}`,
     },
     getStep(name) {
@@ -238,6 +246,14 @@ export class WorkflowEngine extends EventEmitter {
     const key = `${workflow.name}@${workflow.version}`
     if (this._workflows.has(key)) throw new Error(`workflow already registered: ${key}`)
     this._workflows.set(key, workflow)
+    if (this._started && this._pubClient?.isOpen) this._writeRegistry().catch(() => {})
+    return this
+  }
+
+  unregister(name, version) {
+    if (!version) throw new Error('unregister requires an explicit version')
+    const key = `${name}@${version}`
+    if (!this._workflows.delete(key)) throw new Error(`workflow not registered: ${key}`)
     if (this._started && this._pubClient?.isOpen) this._writeRegistry().catch(() => {})
     return this
   }
@@ -385,6 +401,40 @@ export class WorkflowEngine extends EventEmitter {
     }
   }
 
+  async pause(id, reason = 'Paused') {
+    await this.ready()
+    if (!this._tracer) return this._pause(id, reason)
+    return this._tracer.span('workflow.pause', { 'workflow.execution': id }, () => this._pause(id, reason))
+  }
+
+  async _pause(id, reason) {
+    const execution = await this._storage.getExecution(id)
+    if (!execution) throw new Error(`execution not found: ${id}`)
+    if (TERMINAL_EXECUTION_STATUSES.has(execution.status)) {
+      throw new Error(`cannot pause ${execution.status} execution: ${id}`)
+    }
+    if (execution.status === 'paused') return clone(execution)
+
+    const now = Date.now()
+    execution.pausedFrom = execution.status
+    execution.pausedAvailableAt = execution.availableAt
+    execution.status = 'paused'
+    execution.availableAt = null
+    execution.updatedAt = now
+    this._releaseLock(execution)
+    execution.journal.push({
+      type: 'execution.paused',
+      at: now,
+      reason,
+      from: execution.pausedFrom,
+    })
+
+    this._trimJournal(execution)
+    await this._storage.saveExecution(execution)
+    this.emit('execution:paused', { execution: clone(execution) })
+    return clone(execution)
+  }
+
   async resume(id) {
     await this.ready()
     if (!this._tracer) return this._resume(id)
@@ -394,7 +444,8 @@ export class WorkflowEngine extends EventEmitter {
   async _resume(id) {
     const execution = await this._storage.getExecution(id)
     if (!execution) throw new Error(`execution not found: ${id}`)
-    if (execution.status !== 'failed') throw new Error('only failed executions can be resumed')
+    if (execution.status === 'paused') return this._resumePaused(execution)
+    if (execution.status !== 'failed') throw new Error('only failed or paused executions can be resumed')
     if (!execution.currentStep) throw new Error('failed execution has no current step to resume')
 
     const queuedAt = Date.now()
@@ -413,6 +464,75 @@ export class WorkflowEngine extends EventEmitter {
     await this._storage.saveExecution(execution)
     this.emit('execution:queued', { execution: clone(execution) })
     return clone(execution)
+  }
+
+  async _resumePaused(execution) {
+    const now = Date.now()
+    const from = execution.pausedFrom ?? 'queued'
+
+    if (from === 'running') {
+      execution.status = 'queued'
+      execution.availableAt = now
+    } else {
+      execution.status = from
+      execution.availableAt = execution.pausedAvailableAt ?? (from === 'suspended' ? null : now)
+    }
+
+    execution.updatedAt = now
+    delete execution.pausedFrom
+    delete execution.pausedAvailableAt
+    execution.journal.push({
+      type: 'execution.resumed',
+      at: now,
+      step: execution.currentStep,
+    })
+
+    this._trimJournal(execution)
+    await this._storage.saveExecution(execution)
+    if (execution.status === 'queued') this.emit('execution:queued', { execution: clone(execution) })
+    return clone(execution)
+  }
+
+  async restartUnder(id, options = {}) {
+    await this.ready()
+    if (!this._tracer) return this._restartUnder(id, options)
+    return this._tracer.span('workflow.restart', { 'workflow.execution': id }, () => this._restartUnder(id, options))
+  }
+
+  async _restartUnder(id, options) {
+    const previous = await this._storage.getExecution(id)
+    if (!previous) throw new Error(`execution not found: ${id}`)
+
+    const workflow = this._resolveWorkflow(previous.workflow, options.version)
+
+    if (!TERMINAL_EXECUTION_STATUSES.has(previous.status)) {
+      await this._cancel(previous.id, `restarted under ${workflow.name}@${workflow.version}`)
+    }
+
+    const next = await this.start(workflow.name, options.input ?? previous.input, {
+      version: workflow.version,
+      data: options.data ?? previous.data,
+      metadata: options.metadata ?? previous.metadata,
+      tags: options.tags ?? previous.tags,
+      restartedFrom: previous.id,
+    })
+
+    const updated = await this._storage.getExecution(previous.id)
+    if (updated) {
+      const now = Date.now()
+      updated.restartedTo = next.id
+      updated.updatedAt = now
+      updated.journal.push({
+        type: 'execution.restarted',
+        at: now,
+        to: next.id,
+        workflowVersion: workflow.version,
+      })
+      this._trimJournal(updated)
+      await this._storage.saveExecution(updated)
+    }
+
+    return next
   }
 
   async runDue(options = {}) {
@@ -511,6 +631,15 @@ export class WorkflowEngine extends EventEmitter {
       steps: {},
     }
 
+    if (options.restartedFrom) {
+      execution.restartedFrom = options.restartedFrom
+      execution.journal.push({
+        type: 'execution.restarted-from',
+        at: now,
+        from: options.restartedFrom,
+      })
+    }
+
     ensureStepState(execution, workflow.start)
     return execution
   }
@@ -545,7 +674,27 @@ export class WorkflowEngine extends EventEmitter {
     execution.availableAt = at
     execution.updatedAt = at
     this._releaseLock(execution)
-    ensureStepState(execution, nextStep)
+    const state = ensureStepState(execution, nextStep)
+    if (state.status === 'succeeded') this._resetStepForReentry(execution, nextStep, state, at)
+  }
+
+  _resetStepForReentry(execution, stepName, state, at) {
+    const workflow = this._resolveWorkflow(execution.workflow, execution.workflowVersion)
+    const definition = workflow.steps[stepName]
+    const nextPass = (state.pass ?? 1) + 1
+    const maxPasses = definition?.maxPasses ?? 0
+
+    if (maxPasses > 0 && nextPass > maxPasses) {
+      throw new Error(`step "${stepName}" exceeded maxPasses=${maxPasses}`)
+    }
+
+    execution.steps[stepName] = freshStepState(execution, stepName, nextPass)
+    execution.journal.push({
+      type: 'step.reentered',
+      at,
+      step: stepName,
+      pass: nextPass,
+    })
   }
 
   _beginStepRun(execution, stepName, stepState) {

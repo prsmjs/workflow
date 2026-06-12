@@ -153,6 +153,83 @@ All three terminal routes (`succeeded`, `failed`, `canceled`) are required. The 
 
 Canceling a parent execution cascades to any suspended children. A child that terminates while its parent is no longer suspended is a clean no-op - the child's work still runs to completion in case it produced useful side effects.
 
+## Workflows as Data
+
+A workflow definition can be pure JSON. Instead of inline functions, steps reference named handlers from a catalog you pass to `defineWorkflow`. This makes definitions storable in a database, editable through a UI, and producible by tooling - while the code that actually runs stays in your reviewed, tested handler catalog.
+
+```js
+const handlers = {
+  trim: ({ input, params }) => ({ message: input.message.trim() + params.suffix }),
+  route: ({ data, params }) => (data.message.includes(params.word) ? 'spam' : 'ok'),
+  approval: ({ signal }) => signal.decision,
+  accept: ({ data }) => ({ outcome: 'sent', message: data.message }),
+}
+
+const definition = {
+  name: 'review',
+  version: '2',
+  start: 'clean',
+  steps: {
+    clean: { type: 'activity', handler: 'trim', params: { suffix: '!' }, next: 'route' },
+    route: {
+      type: 'decision',
+      handler: 'route',
+      params: { word: 'buy now' },
+      transitions: { spam: 'rejected', ok: 'gate' },
+    },
+    gate: { type: 'wait', handler: 'approval', transitions: { approved: 'accepted', rejected: 'rejected' } },
+    accepted: { type: 'succeed', handler: 'accept' },
+    rejected: { type: 'fail' },
+  },
+}
+
+engine.register(defineWorkflow(definition, { handlers }))
+```
+
+Each step type has exactly one function slot, so a single `handler` field is unambiguous:
+
+| Step type     | Handler binds to |
+| ------------- | ---------------- |
+| `activity`    | `run`            |
+| `decision`    | `decide`         |
+| `wait`        | `resolve`        |
+| `subworkflow` | `input`          |
+| `succeed`     | `result`         |
+| `fail`        | `result`         |
+
+A step may not define both the function and a `handler`. Referencing a handler that is not in the catalog fails at definition time.
+
+`params` is an optional plain JSON object on any step (data-defined or inline). It is passed to the step's function as `context.params`, cloned per invocation. Use it to keep deployment- or workflow-specific configuration in the definition while the handler stays generic.
+
+`handler` and `params` are included in graph nodes, so introspection tools can display exactly which code a step runs and with what configuration.
+
+## Cycles
+
+Workflows are acyclic by default - a back-edge is a definition-time error. Some processes genuinely loop, though: a reviewer requests changes and the draft goes back for revision, a deploy fails verification and rolls back to rebuild. Set `cycles: true` on the definition to allow transitions that route back to an earlier step.
+
+```js
+const workflow = defineWorkflow({
+  name: 'publish-article',
+  version: '1',
+  start: 'draft',
+  cycles: true,
+  steps: {
+    draft: { type: 'activity', next: 'render', maxPasses: 5, run: applyEdits },
+    render: { type: 'activity', next: 'review', run: renderPreview },
+    review: {
+      type: 'decision',
+      transitions: { changes: 'draft', approved: 'done' },
+      decide: ({ data }) => (data.changesRequested ? 'changes' : 'approved'),
+    },
+    done: { type: 'succeed' },
+  },
+})
+```
+
+When a completed step is re-entered, the engine resets its state for a fresh pass: status, attempts, output, and error are cleared, and a `pass` counter increments. Each pass gets a new retry budget and a new idempotency key (`<executionId>:<stepName>:<pass>` from the second pass onward), so external side effects deduplicated by key run once per pass, not once per execution. Every re-entry is recorded in the journal as `step.reentered`.
+
+`maxPasses` is an optional per-step guard against runaway loops. When routing would push a step past its limit, the routing step fails with `step "<name>" exceeded maxPasses=<n>` and normal retry and failure rules apply. Steps without `maxPasses` can loop without limit.
+
 ## Engine API
 
 ```js
@@ -171,6 +248,7 @@ Core methods:
 
 ```js
 engine.register(workflow)
+engine.unregister(name, version)
 await engine.start(name, input, options?)
 await engine.runDue(options?)
 await engine.runUntilIdle(options?)
@@ -178,10 +256,14 @@ await engine.startWorker(options?)
 await engine.getExecution(id)
 await engine.listExecutions(filter?)
 await engine.cancel(id, reason?)
+await engine.pause(id, reason?)
 await engine.resume(id)
+await engine.restartUnder(id, options?)
 await engine.signal(id, payload)
 engine.describe(name, version?)
 ```
+
+`register` and `unregister` work at any time, not just at startup, so workflow versions can be added and removed while workers are running. In-flight executions of an unregistered version will fail to process until it is registered again, so unregister a version only after its executions have drained or been restarted under a newer version.
 
 ## Triggering Workflows
 
@@ -280,7 +362,7 @@ The Postgres adapter uses atomic claiming and owner-guarded saves so only one wo
 
 Each execution stores:
 
-- `status`: `queued | waiting | running | suspended | succeeded | failed | canceled`
+- `status`: `queued | waiting | running | suspended | paused | succeeded | failed | canceled`
 - `currentStep`
 - `steps[stepName]` - persisted state for each step
 - `journal` - timeline of what happened during the execution
@@ -295,12 +377,14 @@ Each step stores:
 - `startedAt`
 - `endedAt`
 - `route`
+- `pass`
 - `idempotencyKey`
 
-Step idempotency keys are stable per execution:
+Step idempotency keys are stable per execution and pass:
 
 ```txt
-<executionId>:<stepName>
+<executionId>:<stepName>          first pass
+<executionId>:<stepName>:<pass>   later passes (cyclic workflows)
 ```
 
 Use them for external side effects.
@@ -327,6 +411,7 @@ Execution lifecycle - use these to sync external state (update your database, pu
 
 ```js
 engine.on('execution:queued', ({ execution }) => {})
+engine.on('execution:paused', ({ execution }) => {})
 engine.on('execution:succeeded', ({ execution }) => {})
 engine.on('execution:failed', ({ execution }) => {})
 engine.on('execution:canceled', ({ execution }) => {})
@@ -375,9 +460,32 @@ Every `activity`, `decision`, and terminal handler receives an `AbortSignal` as 
 
 The signal is advisory. A handler that ignores it still runs to completion, but its result is discarded once the step has timed out or the lease is gone, and the engine applies the normal retry and failure rules.
 
+## Pausing
+
+`engine.pause(id, reason?)` halts any non-terminal execution. Paused executions are never claimed by workers, cannot be signaled, and stay exactly where they are until resumed.
+
+```js
+await engine.pause(executionId, 'pending human review')
+await engine.resume(executionId)
+```
+
+Pause records the status it interrupted and `resume` restores it: a queued execution re-queues, a suspended wait step goes back to waiting for its signal with its original timeout deadline intact, and an execution paused mid-step re-queues at that step. Pausing while a step is in flight uses the same discard semantics as cancellation - the running handler's abort signal fires, its result is thrown away, and the step re-runs from scratch after resume. Both transitions are recorded in the journal as `execution.paused` and `execution.resumed`.
+
 ## Resuming Failed Executions
 
 `engine.resume(id)` re-queues a failed execution from the step that failed. The step's attempt counter is not reset - resume gives the step exactly one more execution attempt. If that attempt fails and the retry budget is already exhausted, the execution fails immediately.
+
+## Restarting Under a New Version
+
+When a workflow definition changes, in-flight executions stay pinned to the version they started on. `engine.restartUnder(id, options?)` moves an execution to a different version explicitly: it cancels the old execution (if it is not already terminal), starts a new one under the target version carrying over `input`, `data`, `metadata`, and `tags`, and links the two in both journals.
+
+```js
+const next = await engine.restartUnder(executionId, { version: '3' })
+// next.restartedFrom -> old execution id
+// old execution's journal gains execution.restarted with the new id
+```
+
+Pass `input`, `data`, `metadata`, or `tags` in options to override what is carried over. The new execution starts from the workflow's start step - completed work is not replayed, so make step side effects idempotent if a restarted execution may repeat them.
 
 ## Journal
 
