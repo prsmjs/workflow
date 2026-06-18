@@ -1,5 +1,22 @@
 import { clone } from './util.js'
 
+/**
+ * @typedef {Object} PostgresDriverOptions
+ * @property {string} [connectionString] - full Postgres connection URL. When provided, host/port/database/user/password are ignored.
+ * @property {string} [host] - database host, used when connectionString is not set.
+ * @property {number} [port] - database port, used when connectionString is not set.
+ * @property {string} [database] - database name, used when connectionString is not set.
+ * @property {string} [user] - database user, used when connectionString is not set.
+ * @property {string} [password] - database password, used when connectionString is not set.
+ * @property {boolean|object} [ssl] - SSL configuration passed through to node-postgres (default none). Use this for managed databases that require TLS.
+ * @property {number} [max] - maximum number of pooled connections (default 10). Size this against your worker concurrency and the database's connection limit.
+ */
+
+/**
+ * Create a Postgres-backed storage adapter for the engine, using atomic claiming and owner-guarded saves so only one worker acquires a ready execution and a stale worker cannot overwrite a newer claimant's state. The right choice for distributed workers sharing the same executions. Requires the `pg` peer dependency.
+ * @param {PostgresDriverOptions} [options] - connection and pool configuration.
+ * @returns {object} a storage adapter for the WorkflowEngine `storage` option.
+ */
 export function postgresDriver(options = {}) {
   const opts = {
     max: 10,

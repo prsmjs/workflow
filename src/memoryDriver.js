@@ -1,5 +1,9 @@
 import { clone } from './util.js'
 
+/**
+ * Create an in-memory storage adapter for the engine. State lives only in this process and is lost when it exits, so this is for tests and local prototypes, not durable or distributed use. This is the engine's default storage when none is supplied.
+ * @returns {object} a storage adapter for the WorkflowEngine `storage` option.
+ */
 export function memoryDriver() {
   const executions = new Map()
 

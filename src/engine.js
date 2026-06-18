@@ -4,6 +4,62 @@ import ms from '@prsm/ms'
 import { memoryDriver } from './memoryDriver.js'
 import { clone } from './util.js'
 
+/**
+ * @typedef {Object} WorkflowEngineOptions
+ * @property {object} [storage] - persistence adapter that stores executions and coordinates workers (default an in-memory driver). Use the in-memory driver for tests and prototypes, and the SQLite or Postgres driver for durable, crash-recoverable state. Postgres is required when more than one worker process shares the same executions.
+ * @property {string|number} [leaseMs] - how long a worker owns a claimed execution before another worker may reclaim it, as a duration string ("5m", "30s") or milliseconds (default "5m"). A worker that crashes mid-step holds its lease only until this window expires, after which the execution becomes available again.
+ * @property {string|number} [leaseRenewInterval] - how often a running step renews its lease so a long step does not lose ownership, as a duration string or milliseconds (default leaseMs / 3, with a floor of 10ms). Keep this comfortably below leaseMs so a renewal can land before the lease expires.
+ * @property {string|number} [defaultActivityTimeout] - timeout applied to activity steps that do not set their own timeout, as a duration string or milliseconds (default "30s"). Decision and terminal steps have no default timeout; only activities inherit this value.
+ * @property {string} [owner] - identity written into claims and checked on every owner-guarded save (default a random "workflow-engine:<uuid>"). Set a stable, per-process value (for example "worker-<pid>") so claims and saves are attributable across restarts.
+ * @property {number} [batchSize] - maximum number of ready executions to claim and process concurrently per polling cycle (default 10). Higher values raise throughput and concurrent load; this is the per-cycle ceiling, not a global limit.
+ * @property {number} [maxJournalEntries] - cap on the number of journal entries retained per execution, where 0 means unbounded (default 0). When the cap is exceeded the oldest entries are dropped, keeping only the most recent ones.
+ * @property {object} [tracer] - optional tracer (for example a prsm/trace tracer) used to wrap start, signal, cancel, pause, resume, and each step in spans. When omitted, no tracing is performed.
+ * @property {object} [pubsub] - optional Redis connection (a node-redis client or a client-options object) that broadcasts execution and step events across engine instances and powers cross-instance workflow discovery. When omitted, events stay local to this process.
+ * @property {string} [pubsubPrefix] - key and channel prefix for the cross-instance event channel and instance registry when pubsub is enabled (default "workflow:"). All instances that should see each other must share the same prefix.
+ */
+
+/**
+ * @typedef {Object} StartOptions
+ * @property {string} [version] - explicit workflow version to start. Required only when more than one version of the same workflow name is registered; otherwise the single registered version is used.
+ * @property {object} [data] - initial mutable working state for the execution, merged into by activity steps that return plain objects (default {}). Available to every step as context.data.
+ * @property {object} [metadata] - arbitrary read-only metadata attached to the execution for your own bookkeeping, never modified by the engine (default {}).
+ * @property {Array} [tags] - free-form tags attached to the execution for filtering and grouping in your own tooling (default []).
+ * @property {string} [id] - explicit execution id to assign instead of a generated UUID. Useful for deterministic ids or idempotent creation; the storage adapter rejects a duplicate id.
+ */
+
+/**
+ * @typedef {Object} RunDueOptions
+ * @property {number} [limit] - maximum number of ready executions to claim and process in this single pass (default the engine's batchSize).
+ */
+
+/**
+ * @typedef {Object} RunUntilIdleOptions
+ * @property {number} [limit] - maximum number of executions to claim per internal runDue pass (default the engine's batchSize).
+ * @property {number} [maxPasses] - safety cap on how many runDue passes to make before giving up (default 100). Exceeding it throws, which signals work that never drains (for example a step that immediately re-queues itself).
+ */
+
+/**
+ * @typedef {Object} StartWorkerOptions
+ * @property {string|number} [interval] - how often the worker polls for ready executions, as a duration string ("1s", "100ms") or milliseconds (default "1s"). Ticks never overlap: a slow cycle delays the next poll rather than running two at once.
+ * @property {number} [batchSize] - maximum executions claimed and processed per poll, overriding the engine's batchSize for this worker only (default the engine's batchSize).
+ */
+
+/**
+ * @typedef {Object} RestartUnderOptions
+ * @property {string} [version] - workflow version to restart the execution under (default the same version the execution already ran on). The new execution starts from the workflow's start step; completed work is not replayed.
+ * @property {*} [input] - input to pass to the new execution (default the previous execution's input).
+ * @property {object} [data] - working state to carry into the new execution (default the previous execution's data).
+ * @property {object} [metadata] - metadata to carry into the new execution (default the previous execution's metadata).
+ * @property {Array} [tags] - tags to carry into the new execution (default the previous execution's tags).
+ */
+
+/**
+ * @typedef {Object} ListExecutionsFilter
+ * @property {string} [workflow] - only return executions of this workflow name.
+ * @property {string} [status] - only return executions in this status (one of "queued", "waiting", "running", "suspended", "paused", "succeeded", "failed", "canceled").
+ * @property {number} [limit] - maximum number of executions to return, most recently created first.
+ */
+
 const DISTRIBUTED_EVENTS = new Set([
   'execution:queued',
   'execution:succeeded',
@@ -24,7 +80,13 @@ const DEFAULT_RETRY = { maxAttempts: 1, backoff: 0 }
 const TERMINAL_EXECUTION_STATUSES = new Set(['succeeded', 'failed', 'canceled'])
 const PROCESSABLE_EXECUTION_STATUSES = new Set(['queued', 'waiting'])
 
+/**
+ * Thrown when signaling, or resolving the wait step of, an execution that is no longer suspended (it was already signaled, canceled, or otherwise moved on). The offending execution id is exposed as `executionId`.
+ */
 export class AlreadySignaledError extends Error {
+  /**
+   * @param {string} executionId - the id of the execution that was no longer suspended.
+   */
   constructor(executionId) {
     super(`execution ${executionId} is no longer suspended`)
     this.name = 'AlreadySignaledError'
@@ -128,6 +190,9 @@ class LeaseLostError extends Error {
 }
 
 export class WorkflowEngine extends EventEmitter {
+  /**
+   * @param {WorkflowEngineOptions} [options] - engine configuration controlling storage, leasing, concurrency, tracing, and cross-instance events.
+   */
   constructor(options = {}) {
     super()
 
@@ -165,6 +230,10 @@ export class WorkflowEngine extends EventEmitter {
     }
   }
 
+  /**
+   * Initialize storage and, if pubsub is configured, the cross-instance event channel and registry. Called automatically by start, signal, and the run methods, so explicit calls are optional and idempotent.
+   * @returns {Promise<void>} resolves once the engine is ready to process work.
+   */
   async ready() {
     if (this._started) return
     this._started = true
@@ -216,6 +285,10 @@ export class WorkflowEngine extends EventEmitter {
     } catch {}
   }
 
+  /**
+   * Discover workflows registered on every engine instance sharing this pubsub prefix, keyed by instance id. Without pubsub configured this returns only the local instance's workflows.
+   * @returns {Promise<Object<string, Array<{name: string, version: string, description: string}>>>} a map of instance id to its registered workflows.
+   */
   async listWorkflowsAcrossInstances() {
     const local = this.listWorkflows().map((w) => ({ ...w, instanceId: this._instanceId }))
     if (!this._pubClient?.isOpen) return { [this._instanceId]: this.listWorkflows() }
@@ -242,6 +315,11 @@ export class WorkflowEngine extends EventEmitter {
     return out
   }
 
+  /**
+   * Register a workflow definition so executions of it can be started and processed. Works at any time, not just at startup, so versions can be added while workers run.
+   * @param {object} workflow - a frozen definition produced by defineWorkflow.
+   * @returns {this} the engine, for chaining.
+   */
   register(workflow) {
     const key = `${workflow.name}@${workflow.version}`
     if (this._workflows.has(key)) throw new Error(`workflow already registered: ${key}`)
@@ -250,6 +328,12 @@ export class WorkflowEngine extends EventEmitter {
     return this
   }
 
+  /**
+   * Remove a registered workflow version. In-flight executions of that version fail to process until it is registered again, so only unregister after its executions have drained or been restarted under a newer version.
+   * @param {string} name - the workflow name.
+   * @param {string} version - the exact version to remove (required; there is no implicit version here).
+   * @returns {this} the engine, for chaining.
+   */
   unregister(name, version) {
     if (!version) throw new Error('unregister requires an explicit version')
     const key = `${name}@${version}`
@@ -258,6 +342,10 @@ export class WorkflowEngine extends EventEmitter {
     return this
   }
 
+  /**
+   * List the workflows registered on this engine instance.
+   * @returns {Array<{name: string, version: string, description: string}>} one entry per registered workflow.
+   */
   listWorkflows() {
     return Array.from(this._workflows.values()).map((workflow) => ({
       name: workflow.name,
@@ -266,6 +354,12 @@ export class WorkflowEngine extends EventEmitter {
     }))
   }
 
+  /**
+   * Return a serializable description of a registered workflow, including its graph of nodes and edges for introspection and visualization.
+   * @param {string} name - the workflow name.
+   * @param {string} [version] - the version to describe; required only when more than one version of the name is registered.
+   * @returns {{name: string, version: string, description: string, graph: object}} the workflow's metadata and graph.
+   */
   describe(name, version) {
     const workflow = this._resolveWorkflow(name, version)
     return clone({
@@ -276,6 +370,13 @@ export class WorkflowEngine extends EventEmitter {
     })
   }
 
+  /**
+   * Create and persist a new execution of a workflow, queued to run on the next worker poll. Returns immediately after persisting; it does not run any steps.
+   * @param {string} name - the workflow name to start.
+   * @param {*} input - the input payload, available to steps as context.input.
+   * @param {StartOptions} [options] - version selection and initial data, metadata, tags, and id.
+   * @returns {Promise<object>} the created execution record in "queued" status.
+   */
   async start(name, input, options = {}) {
     await this.ready()
 
@@ -302,6 +403,12 @@ export class WorkflowEngine extends EventEmitter {
     }, doStart)
   }
 
+  /**
+   * Deliver an external signal to an execution suspended at a wait step, resolving it to one of the step's routes. Idempotent: a second call for an already-resolved execution throws AlreadySignaledError and leaves it unchanged.
+   * @param {string} id - the execution id.
+   * @param {*} payload - the signal payload, passed to the wait step's resolve function and recorded as the step's output. If the step has no resolve function, the payload must include a string `route`.
+   * @returns {Promise<object>} the updated execution after it advances past the wait step.
+   */
   async signal(id, payload) {
     await this.ready()
     if (!this._tracer) return this._signal(id, payload)
@@ -343,16 +450,32 @@ export class WorkflowEngine extends EventEmitter {
     })
   }
 
+  /**
+   * Fetch the full persisted state of a single execution, including its current status, step states, journal, and final output or error.
+   * @param {string} id - the execution id.
+   * @returns {Promise<object|null>} the execution record, or null if no execution has that id.
+   */
   async getExecution(id) {
     await this.ready()
     return await this._storage.getExecution(id)
   }
 
+  /**
+   * List executions, most recently created first, optionally filtered by workflow, status, or count.
+   * @param {ListExecutionsFilter} [filter] - narrowing criteria.
+   * @returns {Promise<Array<object>>} matching execution records.
+   */
   async listExecutions(filter = {}) {
     await this.ready()
     return await this._storage.listExecutions(filter)
   }
 
+  /**
+   * Cancel a non-terminal execution and cascade the cancellation to any suspended child executions. Already-terminal executions are returned unchanged.
+   * @param {string} id - the execution id.
+   * @param {string} [reason] - human-readable reason recorded in the journal and the execution error (default "Canceled").
+   * @returns {Promise<object>} the canceled execution.
+   */
   async cancel(id, reason = 'Canceled') {
     await this.ready()
     if (!this._tracer) return this._cancel(id, reason)
@@ -401,6 +524,12 @@ export class WorkflowEngine extends EventEmitter {
     }
   }
 
+  /**
+   * Halt a non-terminal execution where it stands. Paused executions are never claimed by workers and cannot be signaled; pause records the status it interrupted so resume can restore it. Throws if the execution is already terminal.
+   * @param {string} id - the execution id.
+   * @param {string} [reason] - human-readable reason recorded in the journal (default "Paused").
+   * @returns {Promise<object>} the paused execution.
+   */
   async pause(id, reason = 'Paused') {
     await this.ready()
     if (!this._tracer) return this._pause(id, reason)
@@ -435,6 +564,11 @@ export class WorkflowEngine extends EventEmitter {
     return clone(execution)
   }
 
+  /**
+   * Resume a paused or failed execution. A paused execution returns to the exact status it was paused from (a suspended wait step keeps its original timeout deadline). A failed execution re-queues from the step that failed and gets exactly one more attempt; its attempt counter is not reset, so an exhausted retry budget means it fails again immediately.
+   * @param {string} id - the execution id.
+   * @returns {Promise<object>} the resumed execution.
+   */
   async resume(id) {
     await this.ready()
     if (!this._tracer) return this._resume(id)
@@ -493,6 +627,12 @@ export class WorkflowEngine extends EventEmitter {
     return clone(execution)
   }
 
+  /**
+   * Move an execution to a different workflow version by canceling the old one (if not already terminal) and starting a fresh execution under the target version, carrying over input, data, metadata, and tags and linking the two in both journals. The new execution starts from the workflow's start step, so completed work is not replayed; make step side effects idempotent if a restart may repeat them.
+   * @param {string} id - the execution id to restart.
+   * @param {RestartUnderOptions} [options] - target version and overrides for what is carried over.
+   * @returns {Promise<object>} the new execution, whose restartedFrom points at the old id.
+   */
   async restartUnder(id, options = {}) {
     await this.ready()
     if (!this._tracer) return this._restartUnder(id, options)
@@ -535,6 +675,11 @@ export class WorkflowEngine extends EventEmitter {
     return next
   }
 
+  /**
+   * Claim and process one batch of ready executions, then return. This is a single pass: it does not loop or wait for new work. Use startWorker for a continuous loop.
+   * @param {RunDueOptions} [options] - per-pass claim limit.
+   * @returns {Promise<number>} the number of executions processed in this pass.
+   */
   async runDue(options = {}) {
     await this.ready()
 
@@ -550,6 +695,11 @@ export class WorkflowEngine extends EventEmitter {
     return results.length
   }
 
+  /**
+   * Repeatedly call runDue until a pass processes nothing, draining all immediately runnable work. Useful in tests and scripts; production should use startWorker. Note that work scheduled for the future (a retry backoff, a wait timeout) is not "immediately runnable" and will not be waited for.
+   * @param {RunUntilIdleOptions} [options] - per-pass limit and the maxPasses safety cap.
+   * @returns {Promise<number>} the number of passes it took to reach idle. Throws if maxPasses is exceeded.
+   */
   async runUntilIdle(options = {}) {
     const maxPasses = options.maxPasses ?? 100
 
@@ -561,6 +711,11 @@ export class WorkflowEngine extends EventEmitter {
     throw new Error(`runUntilIdle exceeded maxPasses=${maxPasses}`)
   }
 
+  /**
+   * Start the background polling loop that calls runDue on a timer for the life of the process. This is the production entry point for processing executions. Throws if a worker is already running on this engine.
+   * @param {StartWorkerOptions} [options] - poll interval and per-poll batch size.
+   * @returns {Promise<void>} resolves after the first poll cycle completes; the loop continues in the background until close is called.
+   */
   async startWorker(options = {}) {
     await this.ready()
     if (this._pollTimer) throw new Error('worker already started')
@@ -586,6 +741,10 @@ export class WorkflowEngine extends EventEmitter {
     await tick()
   }
 
+  /**
+   * Stop the worker loop, let any in-flight poll settle, and close storage and pubsub connections. Call this on shutdown so timers and connections do not keep the process alive.
+   * @returns {Promise<void>} resolves once everything is torn down.
+   */
   async close() {
     if (this._pollTimer) clearInterval(this._pollTimer)
     this._pollTimer = null

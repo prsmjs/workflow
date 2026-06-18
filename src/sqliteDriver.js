@@ -28,6 +28,16 @@ function all(db, sql, params = []) {
   })
 }
 
+/**
+ * @typedef {Object} SqliteDriverOptions
+ * @property {string} filename - path to the SQLite database file (required). Use a real path for durable single-node storage, or ":memory:" for an ephemeral database that lives only as long as the process.
+ */
+
+/**
+ * Create a SQLite-backed storage adapter for the engine, giving durable, crash-recoverable state on a single node. For multiple worker processes sharing the same executions, use the Postgres driver instead. Requires the `sqlite3` peer dependency.
+ * @param {SqliteDriverOptions} options - the database file location.
+ * @returns {object} a storage adapter for the WorkflowEngine `storage` option.
+ */
 export function sqliteDriver({ filename }) {
   if (!filename) throw new Error('sqlite filename is required')
 
