@@ -131,6 +131,40 @@ Resume the execution by calling `engine.signal(executionId, payload)`. The paylo
 
 If `timeout` is set, the engine fires the special `timeout` route automatically when the timer expires. Defining a `timeout` requires defining the `timeout` transition.
 
+#### Delay timer
+
+A wait step does not need a signal at all. Give it a `timeout` and a single `timeout` transition, omit `resolve`, and it becomes a pure delay: the execution parks for the duration, then advances to the `timeout` target. This is how you model a mandatory waiting period or a scheduled follow-up.
+
+```js
+{
+  type: "wait",
+  timeout: "5d",
+  transitions: { timeout: "next" },
+}
+```
+
+A wait step never runs code, even when it times out. The timer only routes to the next step. Any logic you want to run after the delay belongs in that next step, not in the wait itself.
+
+A common pattern is to follow a delay with a decision that re-checks state before committing to an action, since the relevant state may have changed during the wait:
+
+```js
+{
+  hold: { type: "wait", timeout: "5d", transitions: { timeout: "recheck" } },
+  recheck: {
+    type: "decision",
+    timeout: "30s",
+    decide: async ({ input }) => (await stillNeeded(input.id)) ? "proceed" : "resolved",
+    transitions: { proceed: "act", resolved: "done" },
+  },
+  act: { type: "activity", next: "done", run: async () => { /* ... */ } },
+  done: { type: "succeed" },
+}
+```
+
+Set a `timeout` on the decision whenever its `decide` calls an external service, because decision steps have no default timeout and a hanging call would block the worker.
+
+When the recheck finds the action is no longer needed, route to a `succeed` terminal rather than calling `engine.cancel()`. An expected outcome that ends the workflow early is a success, not a cancellation; `cancel()` is for aborting work from outside the graph.
+
 ### Subworkflow
 
 A subworkflow step starts a child workflow and waits for it to reach a terminal status. Same `suspended` machinery as `wait`, just driven by the child's terminal event instead of an external signal.

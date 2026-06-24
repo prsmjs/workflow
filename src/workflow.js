@@ -40,7 +40,7 @@ import { clone } from './util.js'
  * @property {Object<string, string>} transitions - map of route name to target step name; must define at least one route (required). When `timeout` is set, a "timeout" route is required here.
  * @property {Function} [resolve] - async function mapping the signal payload to one of the routes in transitions. If omitted, the engine reads a string `route` from the signal payload instead. Provide this or `handler`, not both.
  * @property {string} [handler] - name of a function in the handler catalog to use as `resolve`, for data-defined workflows. Mutually exclusive with `resolve`.
- * @property {string|number} [timeout] - how long to wait before firing the "timeout" route automatically, as a duration string ("7d") or milliseconds (default no timeout, meaning it waits indefinitely). Defining a timeout requires a matching "timeout" transition.
+ * @property {string|number} [timeout] - how long to wait before firing the "timeout" route automatically, as a duration string ("7d") or milliseconds (default no timeout, meaning it waits indefinitely). Defining a timeout requires a matching "timeout" transition. A wait step with only a "timeout" transition and no resolve is a pure delay: it parks the execution for the duration, then advances to the timeout target without running any code.
  * @property {RetryConfig|number} [retry] - retry policy applied if resolution throws (default no retry).
  * @property {object} [params] - plain JSON object passed to the handler as context.params, cloned per invocation (default none).
  * @property {number} [maxPasses] - in cyclic workflows, the maximum number of re-entries before routing to this step fails (default unlimited).
