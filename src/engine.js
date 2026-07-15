@@ -4,6 +4,13 @@ import ms from '@prsm/ms'
 import { memoryDriver } from './memoryDriver.js'
 import { clone } from './util.js'
 
+// node-redis only reads host/port from the nested socket object and silently
+// ignores them at the top level, so lift the documented flat fields into place
+function toClientOptions({ host, port, ...rest } = {}) {
+  if (rest.url || (host === undefined && port === undefined)) return rest
+  return { ...rest, socket: { host: host ?? '127.0.0.1', port: port ?? 6379, ...rest.socket } }
+}
+
 /**
  * @typedef {Object} WorkflowEngineOptions
  * @property {object} [storage] - persistence adapter that stores executions and coordinates workers (default an in-memory driver). Use the in-memory driver for tests and prototypes, and the SQLite or Postgres driver for durable, crash-recoverable state. Postgres is required when more than one worker process shares the same executions.
@@ -244,7 +251,7 @@ export class WorkflowEngine extends EventEmitter {
         this._pubClient = baseRedis
       } else {
         const { createClient } = await import('redis')
-        this._pubClient = createClient(baseRedis)
+        this._pubClient = createClient(toClientOptions(baseRedis))
       }
       this._pubClient.on?.('error', () => {})
       this._subClient = this._pubClient.duplicate()
