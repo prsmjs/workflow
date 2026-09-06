@@ -65,3 +65,7 @@ claimAvailable (must be atomic/transactional and must exclude the paused
 status), renewLease, listExecutions, close. findChildren is optional but
 without it cascade cancellation of subworkflow children silently does
 nothing.
+
+-- anti-patterns-and-pitfalls --
+
+claimAvailable only reclaims executions with status queued/waiting/suspended. An execution that was RUNNING a step when its worker process died keeps status 'running' and is never picked up again after its lease expires - the run is stranded forever. Apps must recover these themselves (e.g. at boot: find running executions with expired leases via the storage driver, reset status to 'queued', clear the lock, set availableAt=now; the step re-runs, so handlers must be idempotent). Long-running activity steps (minutes-long model calls) hit this on every process restart.
