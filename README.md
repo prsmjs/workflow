@@ -274,6 +274,7 @@ const engine = new WorkflowEngine({
   defaultActivityTimeout: '30s',
   owner: 'node-a', // worker identity written into claims and checked on save
   batchSize: 10, // max executions to claim and process concurrently per polling cycle
+- `maxInFlight` (default 50): the ceiling on executions being processed at once. A poll claims only the room left under it and never waits for earlier claims, so a slow step delays its own execution, not the queue.
   maxJournalEntries: 100, // cap journal size, 0 = unlimited (default)
 })
 ```

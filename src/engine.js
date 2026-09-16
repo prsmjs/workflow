@@ -18,7 +18,8 @@ function toClientOptions({ host, port, ...rest } = {}) {
  * @property {string|number} [leaseRenewInterval] - how often a running step renews its lease so a long step does not lose ownership, as a duration string or milliseconds (default leaseMs / 3, with a floor of 10ms). Keep this comfortably below leaseMs so a renewal can land before the lease expires.
  * @property {string|number} [defaultActivityTimeout] - timeout applied to activity steps that do not set their own timeout, as a duration string or milliseconds (default "30s"). Decision and terminal steps have no default timeout; only activities inherit this value.
  * @property {string} [owner] - identity written into claims and checked on every owner-guarded save (default a random "workflow-engine:<uuid>"). Set a stable, per-process value (for example "worker-<pid>") so claims and saves are attributable across restarts.
- * @property {number} [batchSize] - maximum number of ready executions to claim and process concurrently per polling cycle (default 10). Higher values raise throughput and concurrent load; this is the per-cycle ceiling, not a global limit.
+ * @property {number} [batchSize] - maximum number of ready executions to claim per polling cycle (default 10).
+ * @property {number} [maxInFlight] - ceiling on executions being processed at once across polling cycles (default 50). A poll claims only up to the room left under it, and never waits for earlier claims to finish - a slow step holds its own execution, not the queue.
  * @property {number} [maxJournalEntries] - cap on the number of journal entries retained per execution, where 0 means unbounded (default 0). When the cap is exceeded the oldest entries are dropped, keeping only the most recent ones.
  * @property {object} [tracer] - optional tracer (for example a prsm/trace tracer) used to wrap start, signal, cancel, pause, resume, and each step in spans. When omitted, no tracing is performed.
  * @property {object} [pubsub] - optional Redis connection (a node-redis client or a client-options object) that broadcasts execution and step events across engine instances and powers cross-instance workflow discovery. When omitted, events stay local to this process.
@@ -48,7 +49,8 @@ function toClientOptions({ host, port, ...rest } = {}) {
 /**
  * @typedef {Object} StartWorkerOptions
  * @property {string|number} [interval] - how often the worker polls for ready executions, as a duration string ("1s", "100ms") or milliseconds (default "1s"). Ticks never overlap: a slow cycle delays the next poll rather than running two at once.
- * @property {number} [batchSize] - maximum executions claimed and processed per poll, overriding the engine's batchSize for this worker only (default the engine's batchSize).
+ * @property {number} [batchSize] - maximum executions claimed per poll, overriding the engine's batchSize for this worker only (default the engine's batchSize).
+ * @property {number} [maxInFlight] - ceiling on executions in flight for this worker, overriding the engine's maxInFlight (default the engine's maxInFlight).
  */
 
 /**
@@ -215,6 +217,9 @@ export class WorkflowEngine extends EventEmitter {
     this._started = false
     this._activePoll = null
     this._batchSize = options.batchSize ?? 10
+    this._maxInFlight = options.maxInFlight ?? 50
+    this._inFlight = new Set()
+    this._claiming = null
     this._maxJournalEntries = options.maxJournalEntries ?? 0
 
     this._pubsubConfig = options.pubsub ?? null
@@ -719,9 +724,30 @@ export class WorkflowEngine extends EventEmitter {
   }
 
   /**
-   * Start the background polling loop that calls runDue on a timer for the life of the process. This is the production entry point for processing executions. Throws if a worker is already running on this engine.
-   * @param {StartWorkerOptions} [options] - poll interval and per-poll batch size.
-   * @returns {Promise<void>} resolves after the first poll cycle completes; the loop continues in the background until close is called.
+   * Claim a batch of ready executions and start processing each one without waiting for any of them: what the worker loop does on every tick. Processing runs in the background, tracked in the in-flight set, so a slow step delays only its own execution.
+   * @param {{ limit: number }} options - how many executions to claim.
+   * @returns {Promise<number>} the number of executions claimed and started.
+   */
+  async _claimAndRun({ limit }) {
+    const claimed = await this._storage.claimAvailable({
+      now: Date.now(),
+      owner: this._owner,
+      limit,
+      leaseMs: this._leaseMs,
+    })
+    for (const { id } of claimed) {
+      const run = this._processExecution(id)
+        .catch((error) => this.emit('worker:error', { error, executionId: id }))
+        .finally(() => this._inFlight.delete(run))
+      this._inFlight.add(run)
+    }
+    return claimed.length
+  }
+
+  /**
+   * Start the background polling loop for the life of the process. This is the production entry point for processing executions. Each tick claims up to batchSize executions, limited by the room left under maxInFlight, and starts them without waiting for earlier claims to finish. Throws if a worker is already running on this engine.
+   * @param {StartWorkerOptions} [options] - poll interval, per-poll batch size, and the in-flight ceiling.
+   * @returns {Promise<void>} resolves after the first claim completes; the loop continues in the background until close is called.
    */
   async startWorker(options = {}) {
     await this.ready()
@@ -729,15 +755,18 @@ export class WorkflowEngine extends EventEmitter {
 
     const interval = normalizeMs(options.interval ?? '1s')
     const batchSize = options.batchSize ?? this._batchSize
+    const maxInFlight = options.maxInFlight ?? this._maxInFlight
 
     const tick = async () => {
-      if (this._activePoll) return this._activePoll
+      if (this._claiming) return this._claiming
+      const room = maxInFlight - this._inFlight.size
+      if (room <= 0) return 0
 
-      this._activePoll = this.runDue({ limit: batchSize }).finally(() => {
-        this._activePoll = null
+      this._claiming = this._claimAndRun({ limit: Math.min(batchSize, room) }).finally(() => {
+        this._claiming = null
       })
 
-      return this._activePoll
+      return this._claiming
     }
 
     this._pollTimer = setInterval(() => {
@@ -758,6 +787,8 @@ export class WorkflowEngine extends EventEmitter {
     if (this._registryTimer) clearInterval(this._registryTimer)
     this._registryTimer = null
     await this._activePoll
+    await this._claiming
+    await Promise.allSettled([...this._inFlight])
     if (this._storage.close) await this._storage.close()
     if (this._pubClient?.isOpen && this._registryKey) {
       await this._pubClient.del(this._registryKey).catch(() => {})
