@@ -37,11 +37,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nvms/workflow.git"
+    "url": "git+https://github.com/prsmjs/workflow.git"
   },
-  "homepage": "https://github.com/nvms/workflow#readme",
+  "homepage": "https://github.com/prsmjs/workflow#readme",
   "bugs": {
-    "url": "https://github.com/nvms/workflow/issues"
+    "url": "https://github.com/prsmjs/workflow/issues"
   },
   "dependencies": {
     "@prsm/ms": "^2.0.0"
