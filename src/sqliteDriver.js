@@ -120,12 +120,17 @@ export function sqliteDriver({ filename }) {
         clauses.push('status = ?')
         params.push(options.expectedStatus)
       }
+      if (options.expectedUpdatedAt != null) {
+        clauses.push('updated_at = ?')
+        params.push(options.expectedUpdatedAt)
+      }
+      const guarded = options.expectedLockOwner != null || options.expectedStatus != null || options.expectedUpdatedAt != null
       const sql = `UPDATE workflow_executions
         SET workflow = ?, status = ?, available_at = ?, lock_owner = ?, lock_expires_at = ?, updated_at = ?, body = ?
         WHERE ${clauses.join(' AND ')}`
 
       const result = await run(db, sql, params)
-      if ((options.expectedLockOwner != null || options.expectedStatus != null) && result.changes === 0) return null
+      if (guarded && result.changes === 0) return null
       return clone(execution)
     },
 

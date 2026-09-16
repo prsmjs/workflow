@@ -125,12 +125,17 @@ export function postgresDriver(options = {}) {
         clauses.push(`status = $${nextIndex++}`)
         params.push(options.expectedStatus)
       }
+      if (options.expectedUpdatedAt != null) {
+        clauses.push(`updated_at = $${nextIndex++}`)
+        params.push(options.expectedUpdatedAt)
+      }
+      const guarded = options.expectedLockOwner != null || options.expectedStatus != null || options.expectedUpdatedAt != null
       const sql = `UPDATE workflow_executions
         SET workflow = $1, status = $2, available_at = $3, lock_owner = $4, lock_expires_at = $5, updated_at = $6, body = $7::jsonb
         WHERE ${clauses.join(' AND ')}`
 
       const result = await query(sql, params)
-      if ((options.expectedLockOwner != null || options.expectedStatus != null) && result.rowCount === 0) return null
+      if (guarded && result.rowCount === 0) return null
       return clone(execution)
     },
 

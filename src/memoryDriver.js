@@ -28,6 +28,9 @@ export function memoryDriver() {
       if (options.expectedStatus != null && current.status !== options.expectedStatus) {
         return null
       }
+      if (options.expectedUpdatedAt != null && current.updatedAt !== options.expectedUpdatedAt) {
+        return null
+      }
       executions.set(execution.id, clone(execution))
       return clone(execution)
     },
